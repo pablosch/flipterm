@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flipterm</title>
+<style>
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: #050805; color: #8f8; font: 14px/1.4 ui-monospace, Menlo, Consolas, monospace; overflow-x: hidden; }
+body::after { content: ''; position: fixed; inset: 0; pointer-events: none; background: repeating-linear-gradient(0deg, rgba(0,0,0,.16) 0 1px, transparent 1px 3px); }
+#term { padding: 14px 14px 70px; }
+.line { white-space: pre-wrap; min-height: 1.2em; text-shadow: 0 0 6px rgba(80,255,120,.22); }
+.sys { color: #5a7a5a; }
+.err { color: #ff6b6b; }
+.warn { color: #ffd166; }
+.good { color: #7cff7c; font-weight: 700; }
+.prompt { color: #66e0ff; }
+.table { color: #a9c8ff; }
+.me { color: #eee; }
+#bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 14px; background: #030503; border-top: 1px solid #143314; z-index: 5; }
+#ps1 { color: #7cff7c; }
+#caret { animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+#kb { position: fixed; bottom: 0; left: 0; opacity: 0; width: 1px; height: 1px; border: 0; padding: 0; }
+.fly { position: fixed; color: #ffd166; font-weight: 700; transition: transform 1.7s ease-out, opacity 2s; z-index: 10; }
+#flipov { position: fixed; top: 38%; left: 50%; transform: translateX(-50%); font-size: 2.4rem; color: #fff; z-index: 11; text-shadow: 0 0 14px #f66; white-space: pre; }
+.shake { animation: shake .6s; }
+@keyframes shake { 0%,100% { transform: none; } 20% { transform: translate(-6px,3px); } 40% { transform: translate(5px,-4px); } 60% { transform: translate(-4px,2px); } 80% { transform: translate(3px,-2px); } }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<div id="bar"><span id="ps1">flipterm&gt; </span><span id="typed"></span><span id="caret">█</span></div>
+<input id="kb" autocomplete="off" autocapitalize="off" spellcheck="false">
+<script>
+const term = document.getElementById('term');
+const typed = document.getElementById('typed');
+const kb = document.getElementById('kb');
+
+let id = sessionStorage.getItem('flip7id');
+if (!id) { id = Math.random().toString(36).slice(2, 12); sessionStorage.setItem('flip7id', id); }
+
+const es = new EventSource('/events?id=' + id);
+es.onmessage = e => {
+  const m = JSON.parse(e.data);
+  if (m.type === 'line') addLine(m.text, m.cls);
+  else if (m.type === 'fliptable') flipAnim(m.by);
+};
+
+function addLine(text, cls) {
+  const d = document.createElement('div');
+  d.className = 'line' + (cls ? ' ' + cls : '');
+  d.textContent = text;
+  term.appendChild(d);
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+const hist = [];
+let hi = 0;
+function submit() {
+  const v = kb.value.trim();
+  kb.value = '';
+  typed.textContent = '';
+  if (!v) return;
+  addLine('flipterm> ' + v, 'me');
+  hist.push(v);
+  hi = hist.length;
+  fetch('/cmd', { method: 'POST', body: JSON.stringify({ id, cmd: v }) });
+}
+
+kb.addEventListener('input', () => { typed.textContent = kb.value; });
+kb.addEventListener('keydown', e => {
+  if (e.key === 'Enter') submit();
+  else if (e.key === 'ArrowUp') { if (hi > 0) { hi--; kb.value = hist[hi]; typed.textContent = kb.value; } e.preventDefault(); }
+  else if (e.key === 'ArrowDown') { if (hi < hist.length) { hi++; kb.value = hist[hi] || ''; typed.textContent = kb.value; } e.preventDefault(); }
+});
+document.addEventListener('click', () => kb.focus());
+kb.focus();
+
+function flipAnim(by) {
+  const lines = [...term.querySelectorAll('.line')];
+  lines.forEach(el => {
+    el.style.transition = `transform ${0.7 + Math.random() * 0.6}s cubic-bezier(.2,.6,.4,1), opacity 1.2s`;
+    el.style.transform = `translate(${(Math.random() * 2 - 1) * 700}px, ${-(150 + Math.random() * 600)}px) rotate(${(Math.random() * 2 - 1) * 720}deg)`;
+    el.style.opacity = 0;
+  });
+  for (let i = 0; i < 24; i++) spawnCard();
+  const ov = document.createElement('div');
+  ov.id = 'flipov';
+  document.body.appendChild(ov);
+  const frames = ['(°-°)   ┬─┬', '(°□°)   ┬─┬', '(╯°□°)╯   ┬─┬', '(╯°□°)╯︵ ┻━┻', '(╯°□°)╯︵    ┻━┻', '(╯°□°)╯︵       ┻━┻'];
+  let f = 0;
+  const tm = setInterval(() => {
+    ov.textContent = frames[Math.min(f, frames.length - 1)];
+    if (f === 3) { document.body.classList.add('shake'); setTimeout(() => document.body.classList.remove('shake'), 700); }
+    f++;
+    if (f > frames.length + 3) { clearInterval(tm); ov.remove(); term.innerHTML = ''; }
+  }, 170);
+}
+
+function spawnCard() {
+  const s = document.createElement('span');
+  s.className = 'fly';
+  const faces = ['[7]', '[12]', '[+4]', '[x2]', '[3]', '[FREEZE]', '[9]', '[SC]', '[FLIP3]', '[0]', '[+10]', '[5]', '[11]', '[2]'];
+  s.textContent = faces[Math.floor(Math.random() * faces.length)];
+  s.style.left = (20 + Math.random() * 60) + 'vw';
+  s.style.top = (40 + Math.random() * 30) + 'vh';
+  document.body.appendChild(s);
+  requestAnimationFrame(() => {
+    s.style.transform = `translate(${(Math.random() * 2 - 1) * 80}vw, ${-(40 + Math.random() * 60)}vh) rotate(${(Math.random() * 2 - 1) * 1080}deg)`;
+    s.style.opacity = 0;
+  });
+  setTimeout(() => s.remove(), 2600);
+}
+</script>
+</body>
+</html>
