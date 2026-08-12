@@ -2,18 +2,31 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = 7177;
+const PORT = +process.env.PORT || 7177;
 const BOT_MS = +process.env.BOT_MS || 700;
 const BOT_NAMES = ['hal9000', 'glados', 'skynet', 'wopr', 'deepblue'];
 const conns = new Map();
+const nicks = new Map();
+const tables = new Map();
 
-const game = {
-  phase: 'lobby', // lobby | between | dealing | playing | over
-  players: [],
-  deck: [], discard: [],
-  round: 0, first: -1, turn: 0,
-  tasks: [], pending: null, timer: null,
-};
+function newTable(name) {
+  return {
+    name,
+    phase: 'lobby', // lobby | between | dealing | playing | over
+    players: [],
+    deck: [], discard: [],
+    round: 0, first: -1, turn: 0,
+    tasks: [], pending: null, timer: null,
+  };
+}
+
+function findSeat(id) {
+  for (const t of tables.values()) {
+    const p = t.players.find(x => x.id === id);
+    if (p) return { t, p };
+  }
+  return null;
+}
 
 function shuffle(a) {
   for (let i = a.length - 1; i > 0; i--) {
@@ -39,24 +52,24 @@ function cardLabel(c) {
   return { freeze: 'FREEZE', flip3: 'FLIP3', sc: 'SC' }[c.t];
 }
 
-function send(p, msg) {
-  const res = conns.get(p.id);
+function sendTo(id, msg) {
+  const res = conns.get(id);
   if (res) { try { res.write(`data: ${JSON.stringify(msg)}\n\n`); } catch {} }
 }
-function all(msg) { game.players.forEach(p => send(p, msg)); }
-function line(text, cls) { all({ type: 'line', text, cls }); }
-function lineTo(p, text, cls) { send(p, { type: 'line', text, cls }); }
+function lineId(id, text, cls) { sendTo(id, { type: 'line', text, cls }); }
+function line(t, text, cls) { t.players.forEach(p => lineId(p.id, text, cls)); }
+function lineTo(p, text, cls) { lineId(p.id, text, cls); }
 
-const actives = () => game.players.filter(p => p.status === 'active');
+const actives = t => t.players.filter(p => p.status === 'active');
 
-function draw() {
-  if (!game.deck.length) {
-    if (!game.discard.length) return null;
-    game.deck = shuffle(game.discard);
-    game.discard = [];
-    line('· deck ran out: reshuffling the discard pile ·', 'sys');
+function draw(t) {
+  if (!t.deck.length) {
+    if (!t.discard.length) return null;
+    t.deck = shuffle(t.discard);
+    t.discard = [];
+    line(t, '· deck ran out: reshuffling the discard pile ·', 'sys');
   }
-  return game.deck.pop();
+  return t.deck.pop();
 }
 
 function computeScore(p) {
@@ -68,124 +81,124 @@ function computeScore(p) {
   return s;
 }
 
-function tableLines() {
+function tableLines(t) {
   const L = [];
-  L.push(`── TABLE · round ${game.round} · deck ${game.deck.length} ──`);
-  game.players.forEach((p, i) => {
-    const mark = game.phase === 'playing' && i === game.turn && p.status === 'active' ? '▶' : ' ';
+  L.push(`── ${t.name} · round ${t.round} · deck ${t.deck.length} ──`);
+  t.players.forEach((p, i) => {
+    const mark = t.phase === 'playing' && i === t.turn && p.status === 'active' ? '▶' : ' ';
     const hand = [...p.cards.map(cardLabel), ...p.mods.map(cardLabel)].join(' ');
     const st = { active: 'active', stayed: 'stay', frozen: 'FROZEN', busted: 'BUST' }[p.status];
     L.push(` ${mark} ${p.name.padEnd(12)} [${hand}]${p.scCard ? ' (SC)' : ''} ${st}`);
   });
-  L.push(' TOTALS: ' + game.players.map(p => `${p.name} ${p.total}`).join(' | '));
+  L.push(' TOTALS: ' + t.players.map(p => `${p.name} ${p.total}`).join(' | '));
   return L;
 }
-function showTable() { tableLines().forEach(t => line(t, 'table')); }
+function showTable(t) { tableLines(t).forEach(x => line(t, x, 'table')); }
 
-function resolveAction(p, c) {
+function resolveAction(t, p, c) {
   if (c.t === 'sc') {
-    if (!p.scCard) { p.scCard = c; line(`${p.name} keeps their SECOND CHANCE`, 'good'); return; }
-    const elig = actives().filter(x => x !== p && !x.scCard);
-    if (!elig.length) { game.discard.push(c); line('nobody can take the SECOND CHANCE: discarded', 'sys'); return; }
-    if (elig.length === 1) { elig[0].scCard = c; line(`${p.name} gives the SECOND CHANCE to ${elig[0].name}`, 'good'); return; }
-    game.pending = { kind: 'sc', chooser: p, card: c, elig };
+    if (!p.scCard) { p.scCard = c; line(t, `${p.name} keeps their SECOND CHANCE`, 'good'); return; }
+    const elig = actives(t).filter(x => x !== p && !x.scCard);
+    if (!elig.length) { t.discard.push(c); line(t, 'nobody can take the SECOND CHANCE: discarded', 'sys'); return; }
+    if (elig.length === 1) { elig[0].scCard = c; line(t, `${p.name} gives the SECOND CHANCE to ${elig[0].name}`, 'good'); return; }
+    t.pending = { kind: 'sc', chooser: p, card: c, elig };
     return;
   }
-  const elig = actives();
-  if (!elig.length) { game.discard.push(c); return; }
-  if (elig.length === 1) { applyTarget(p, c, elig[0]); return; }
-  game.pending = { kind: c.t, chooser: p, card: c, elig };
+  const elig = actives(t);
+  if (!elig.length) { t.discard.push(c); return; }
+  if (elig.length === 1) { applyTarget(t, p, c, elig[0]); return; }
+  t.pending = { kind: c.t, chooser: p, card: c, elig };
 }
 
-function applyTarget(chooser, c, target) {
-  game.discard.push(c);
+function applyTarget(t, chooser, c, target) {
+  t.discard.push(c);
   if (c.t === 'freeze') {
     target.status = 'frozen';
-    line(`❄ ${chooser.name} freezes ${target.name}: they bank their cards and are out of the round`, 'warn');
+    line(t, `❄ ${chooser.name} freezes ${target.name}: they bank their cards and are out of the round`, 'warn');
   } else {
-    line(`⟳ ${chooser.name} throws FLIP3 at ${target.name}: they draw 3 cards in a row`, 'warn');
-    game.tasks.unshift({ player: target, source: 'flip3' }, { player: target, source: 'flip3' }, { player: target, source: 'flip3' });
+    line(t, `⟳ ${chooser.name} throws FLIP3 at ${target.name}: they draw 3 cards in a row`, 'warn');
+    t.tasks.unshift({ player: target, source: 'flip3' }, { player: target, source: 'flip3' }, { player: target, source: 'flip3' });
   }
 }
 
-function resolveOne(t) {
-  const p = t.player;
-  if (t.source === 'held') { resolveAction(p, t.card); return; }
-  const c = draw();
-  if (!c) { line('no cards left: forced end of round', 'warn'); endRound(); return; }
-  const via = t.source === 'flip3' ? ' (flip3)' : t.source === 'deal' ? ' (deal)' : '';
+function resolveOne(t, task) {
+  const p = task.player;
+  if (task.source === 'held') { resolveAction(t, p, task.card); return; }
+  const c = draw(t);
+  if (!c) { line(t, 'no cards left: forced end of round', 'warn'); endRound(t); return; }
+  const via = task.source === 'flip3' ? ' (flip3)' : task.source === 'deal' ? ' (deal)' : '';
   if (c.t === 'n') {
     if (p.cards.some(x => x.v === c.v)) {
       if (p.scCard) {
-        game.discard.push(c, p.scCard);
+        t.discard.push(c, p.scCard);
         p.scCard = null;
-        line(`${p.name} draws ${c.v}${via}: duplicate! uses their SECOND CHANCE and survives`, 'warn');
+        line(t, `${p.name} draws ${c.v}${via}: duplicate! uses their SECOND CHANCE and survives`, 'warn');
       } else {
         p.cards.push(c);
         p.status = 'busted';
-        line(`${p.name} draws ${c.v}${via}: DUPLICATE! BUST, 0 points this round`, 'err');
+        line(t, `${p.name} draws ${c.v}${via}: DUPLICATE! BUST, 0 points this round`, 'err');
       }
     } else {
       p.cards.push(c);
-      line(`${p.name} draws ${c.v}${via}`);
+      line(t, `${p.name} draws ${c.v}${via}`);
       if (p.cards.length === 7) {
         p.flip7 = true;
-        line(`★★★ FLIP 7 by ${p.name}! +15 and the round ends ★★★`, 'good');
-        endRound();
+        line(t, `★★★ FLIP 7 by ${p.name}! +15 and the round ends ★★★`, 'good');
+        endRound(t);
       }
     }
   } else if (c.t === 'mod' || c.t === 'x2') {
     p.mods.push(c);
-    line(`${p.name} draws ${cardLabel(c)}${via}`);
+    line(t, `${p.name} draws ${cardLabel(c)}${via}`);
   } else {
-    line(`${p.name} draws ${cardLabel(c)}${via}`, 'warn');
-    if (t.source === 'flip3' && c.t !== 'sc') {
+    line(t, `${p.name} draws ${cardLabel(c)}${via}`, 'warn');
+    if (task.source === 'flip3' && c.t !== 'sc') {
       let i = 0;
-      while (i < game.tasks.length && game.tasks[i].source === 'flip3') i++;
-      game.tasks.splice(i, 0, { player: p, source: 'held', card: c });
+      while (i < t.tasks.length && t.tasks[i].source === 'flip3') i++;
+      t.tasks.splice(i, 0, { player: p, source: 'held', card: c });
       lineTo(p, '(action card resolves after the FLIP3 ends)', 'sys');
     } else {
-      resolveAction(p, c);
+      resolveAction(t, p, c);
     }
   }
 }
 
-function promptPending() {
-  const { kind, chooser, elig } = game.pending;
+function promptPending(t) {
+  const { kind, chooser, elig } = t.pending;
   const label = { freeze: 'FREEZE', flip3: 'FLIP3', sc: 'SECOND CHANCE' }[kind];
   lineTo(chooser, `— pick a target for ${label}: ${elig.map(e => e.name).join(' | ')}  (type the name)`, 'prompt');
-  game.players.filter(x => x !== chooser).forEach(x => lineTo(x, `— ${chooser.name} is picking a target for ${label}... —`, 'sys'));
-  if (chooser.isBot) setTimeout(botChoose, BOT_MS + Math.random() * BOT_MS);
+  t.players.filter(x => x !== chooser).forEach(x => lineTo(x, `— ${chooser.name} is picking a target for ${label}... —`, 'sys'));
+  if (chooser.isBot) setTimeout(() => botChoose(t), BOT_MS + Math.random() * BOT_MS);
 }
 
-function promptTurn() {
-  showTable();
-  const p = game.players[game.turn];
-  game.players.forEach(x => lineTo(x, x === p ? `— your turn, ${p.name}: hit | stay` : `— ${p.name}'s turn —`, x === p ? 'prompt' : 'sys'));
-  if (p.isBot) setTimeout(() => botTurn(p), BOT_MS + Math.random() * BOT_MS);
+function promptTurn(t) {
+  showTable(t);
+  const p = t.players[t.turn];
+  t.players.forEach(x => lineTo(x, x === p ? `— your turn, ${p.name}: hit | stay` : `— ${p.name}'s turn —`, x === p ? 'prompt' : 'sys'));
+  if (p.isBot) setTimeout(() => botTurn(t, p), BOT_MS + Math.random() * BOT_MS);
 }
 
-function resolveChoice(chooser, target) {
-  const pd = game.pending;
-  game.pending = null;
-  if (pd.kind === 'sc') { target.scCard = pd.card; line(`${chooser.name} gives the SECOND CHANCE to ${target.name}`, 'good'); }
-  else applyTarget(chooser, pd.card, target);
-  proceed();
+function resolveChoice(t, chooser, target) {
+  const pd = t.pending;
+  t.pending = null;
+  if (pd.kind === 'sc') { target.scCard = pd.card; line(t, `${chooser.name} gives the SECOND CHANCE to ${target.name}`, 'good'); }
+  else applyTarget(t, chooser, pd.card, target);
+  proceed(t);
 }
 
-function botTurn(p) {
-  if (game.phase !== 'playing' || game.players[game.turn] !== p || game.pending || p.status !== 'active') return;
+function botTurn(t, p) {
+  if (t.phase !== 'playing' || t.players[t.turn] !== p || t.pending || p.status !== 'active') return;
   const sum = p.cards.reduce((a, c) => a + c.v, 0);
   let hit;
   if (p.cards.length === 6) hit = Math.random() < 0.5;
   else if (p.scCard && sum < 30) hit = true;
   else hit = sum + Math.random() * 8 < 18;
-  if (hit) { game.tasks.push({ player: p, source: 'hit' }); proceed(); }
-  else { p.status = 'stayed'; line(`${p.name} stays`, 'sys'); proceed(); }
+  if (hit) { t.tasks.push({ player: p, source: 'hit' }); proceed(t); }
+  else { p.status = 'stayed'; line(t, `${p.name} stays`, 'sys'); proceed(t); }
 }
 
-function botChoose() {
-  const pd = game.pending;
+function botChoose(t) {
+  const pd = t.pending;
   if (!pd || !pd.chooser.isBot) return;
   const bot = pd.chooser;
   const others = pd.elig.filter(e => e !== bot);
@@ -193,113 +206,128 @@ function botChoose() {
   if (pd.kind === 'freeze') target = others.length ? others.reduce((a, b) => computeScore(b) > computeScore(a) ? b : a) : pd.elig[0];
   else if (pd.kind === 'flip3' && bot.status === 'active' && bot.cards.length <= 2 && pd.elig.includes(bot)) target = bot;
   else target = others[Math.floor(Math.random() * others.length)] || pd.elig[0];
-  resolveChoice(bot, target);
+  resolveChoice(t, bot, target);
 }
 
-function nextTurnOrEnd() {
-  const n = game.players.length;
+function nextTurnOrEnd(t) {
+  const n = t.players.length;
   for (let k = 1; k <= n; k++) {
-    const i = (game.turn + k) % n;
-    if (game.players[i].status === 'active') { game.turn = i; promptTurn(); return; }
+    const i = (t.turn + k) % n;
+    if (t.players[i].status === 'active') { t.turn = i; promptTurn(t); return; }
   }
-  endRound();
+  endRound(t);
 }
 
-function proceed() {
-  if (game.pending) { promptPending(); return; }
-  while (game.tasks.length) {
-    const t = game.tasks.shift();
-    if (t.player.status !== 'active') { if (t.card) game.discard.push(t.card); continue; }
-    resolveOne(t);
-    if (game.phase !== 'dealing' && game.phase !== 'playing') return;
-    if (game.pending) { promptPending(); return; }
+function proceed(t) {
+  if (t.pending) { promptPending(t); return; }
+  while (t.tasks.length) {
+    const task = t.tasks.shift();
+    if (task.player.status !== 'active') { if (task.card) t.discard.push(task.card); continue; }
+    resolveOne(t, task);
+    if (t.phase !== 'dealing' && t.phase !== 'playing') return;
+    if (t.pending) { promptPending(t); return; }
   }
-  if (game.phase === 'dealing') {
-    game.phase = 'playing';
-    game.turn = (game.first - 1 + game.players.length) % game.players.length;
-    nextTurnOrEnd();
-  } else if (game.phase === 'playing') {
-    nextTurnOrEnd();
+  if (t.phase === 'dealing') {
+    t.phase = 'playing';
+    t.turn = (t.first - 1 + t.players.length) % t.players.length;
+    nextTurnOrEnd(t);
+  } else if (t.phase === 'playing') {
+    nextTurnOrEnd(t);
   }
 }
 
-function endRound() {
-  if (game.phase !== 'dealing' && game.phase !== 'playing') return;
-  game.tasks = [];
-  game.pending = null;
-  game.phase = 'between';
-  line(`── END OF ROUND ${game.round} ──`, 'table');
-  for (const p of game.players) {
+function endRound(t) {
+  if (t.phase !== 'dealing' && t.phase !== 'playing') return;
+  t.tasks = [];
+  t.pending = null;
+  t.phase = 'between';
+  line(t, `── END OF ROUND ${t.round} ──`, 'table');
+  for (const p of t.players) {
     const s = computeScore(p);
     p.total += s;
     const hand = p.status === 'busted' ? 'BUST' : [...p.cards.map(cardLabel), ...p.mods.map(cardLabel)].join(' ') || '(nothing)';
-    line(` ${p.name.padEnd(12)} ${hand}${p.flip7 ? ' FLIP7 +15!' : ''} → +${s}  (total ${p.total})`, 'table');
-    game.discard.push(...p.cards, ...p.mods);
-    if (p.scCard) { game.discard.push(p.scCard); p.scCard = null; }
+    line(t, ` ${p.name.padEnd(12)} ${hand}${p.flip7 ? ' FLIP7 +15!' : ''} → +${s}  (total ${p.total})`, 'table');
+    t.discard.push(...p.cards, ...p.mods);
+    if (p.scCard) { t.discard.push(p.scCard); p.scCard = null; }
     p.cards = []; p.mods = []; p.flip7 = false;
   }
-  const max = Math.max(...game.players.map(p => p.total));
+  const max = Math.max(...t.players.map(p => p.total));
   if (max >= 200) {
-    const top = game.players.filter(p => p.total === max);
-    if (top.length === 1) { gameOver(top[0]); return; }
-    line('tie at the top: tiebreaker round', 'warn');
+    const top = t.players.filter(p => p.total === max);
+    if (top.length === 1) { gameOver(t, top[0]); return; }
+    line(t, 'tie at the top: tiebreaker round', 'warn');
   }
-  game.timer = setTimeout(startRound, 1500);
+  t.timer = setTimeout(() => startRound(t), 1500);
 }
 
-function gameOver(w) {
-  game.phase = 'over';
-  line(`★ ${w.name} WINS with ${w.total} points ★`, 'good');
-  line('type start to play again', 'sys');
+function gameOver(t, w) {
+  t.phase = 'over';
+  line(t, `★ ${w.name} WINS with ${w.total} points ★`, 'good');
+  line(t, 'type start to play again', 'sys');
 }
 
-function startRound() {
-  if (game.phase !== 'between') return;
-  game.round++;
-  const n = game.players.length;
-  game.first = (game.first + 1) % n;
-  game.players.forEach(p => { p.status = 'active'; });
-  game.phase = 'dealing';
-  line(`════ ROUND ${game.round} ════`, 'good');
-  for (let k = 0; k < n; k++) game.tasks.push({ player: game.players[(game.first + k) % n], source: 'deal' });
-  proceed();
+function startRound(t) {
+  if (t.phase !== 'between') return;
+  t.round++;
+  const n = t.players.length;
+  t.first = (t.first + 1) % n;
+  t.players.forEach(p => { p.status = 'active'; });
+  t.phase = 'dealing';
+  line(t, `════ ROUND ${t.round} ════`, 'good');
+  for (let k = 0; k < n; k++) t.tasks.push({ player: t.players[(t.first + k) % n], source: 'deal' });
+  proceed(t);
 }
 
-function startGame() {
-  clearTimeout(game.timer);
-  game.deck = shuffle(buildDeck());
-  game.discard = [];
-  game.round = 0;
-  game.first = -1;
-  game.tasks = [];
-  game.pending = null;
-  game.players.forEach(p => { p.total = 0; p.cards = []; p.mods = []; p.scCard = null; p.flip7 = false; p.status = 'active'; });
-  game.phase = 'between';
-  startRound();
+function startGame(t) {
+  clearTimeout(t.timer);
+  t.deck = shuffle(buildDeck());
+  t.discard = [];
+  t.round = 0;
+  t.first = -1;
+  t.tasks = [];
+  t.pending = null;
+  t.players.forEach(p => { p.total = 0; p.cards = []; p.mods = []; p.scCard = null; p.flip7 = false; p.status = 'active'; });
+  t.phase = 'between';
+  startRound(t);
 }
 
-function fliptable(p) {
-  clearTimeout(game.timer);
-  all({ type: 'fliptable', by: p.name });
-  game.phase = 'lobby';
-  game.tasks = [];
-  game.pending = null;
-  game.round = 0;
-  game.players.forEach(x => { x.total = 0; x.cards = []; x.mods = []; x.scCard = null; x.flip7 = false; x.status = 'active'; });
-  game.timer = setTimeout(() => {
-    line(`※ ${p.name} FLIPPED THE TABLE ※  (╯°□°)╯︵ ┻━┻`, 'err');
-    line('cards everywhere... game voided. type start to play again', 'sys');
+function fliptable(t, p) {
+  clearTimeout(t.timer);
+  t.players.forEach(x => sendTo(x.id, { type: 'fliptable', by: p.name }));
+  t.phase = 'lobby';
+  t.tasks = [];
+  t.pending = null;
+  t.round = 0;
+  t.players.forEach(x => { x.total = 0; x.cards = []; x.mods = []; x.scCard = null; x.flip7 = false; x.status = 'active'; });
+  t.timer = setTimeout(() => {
+    line(t, `※ ${p.name} FLIPPED THE TABLE ※  (╯°□°)╯︵ ┻━┻`, 'err');
+    line(t, 'cards everywhere... game voided. type start to play again', 'sys');
   }, 2300);
+}
+
+function endTable(t, p) {
+  clearTimeout(t.timer);
+  line(t, `${p.name} ended table ${t.name}: everyone up, seats cleared`, 'err');
+  line(t, 'back to the hall: tables, create <table> or enter <table>', 'sys');
+  t.phase = 'lobby';
+  t.tasks = [];
+  t.pending = null;
+  tables.delete(t.name.toLowerCase());
 }
 
 const HELP = [
   'commands:',
-  '  join <name>     sit at the table',
+  '  join <name>     pick your player name',
+  '  tables          list tables',
+  '  create <table>  create a table and sit at it',
+  '  enter <table>   sit at an existing table (before it starts)',
+  '  leave           leave your table (before it starts)',
   '  start           start the game (bots fill the table up to 3 players)',
   '  hit             draw a card on your turn',
   '  stay            stand and bank your points',
   '  <name>          pick a target when asked (FREEZE/FLIP3/SC)',
-  '  table           show the table',
+  '  table           show your table',
+  '  end             end your table and clear all seats',
   '  fliptable       (╯°□°)╯︵ ┻━┻',
   '  help            this help',
   'rules: 7 unique numbers = +15 and ends the round · duplicate number = BUST · first to 200 wins',
@@ -310,66 +338,106 @@ function handle(id, raw) {
   if (!text) return;
   const [cmd, ...rest] = text.split(/\s+/);
   const c = cmd.toLowerCase();
-  let p = game.players.find(x => x.id === id);
-  const me = p || { id };
+  const seat = findSeat(id);
+  const nick = nicks.get(id);
 
-  if (c === 'help') { HELP.forEach(l => lineTo(me, l, 'sys')); return; }
+  if (c === 'help') { HELP.forEach(l => lineId(id, l, 'sys')); return; }
 
   if (c === 'join') {
-    if (p) { lineTo(p, `you're already at the table as ${p.name}`, 'err'); return; }
+    if (seat) { lineId(id, `you're already at table ${seat.t.name} as ${seat.p.name}`, 'err'); return; }
     const name = rest[0];
-    if (!name || !/^[\w-]{1,12}$/.test(name)) { lineTo(me, 'usage: join <name> (letters/numbers, max 12)', 'err'); return; }
-    if (game.players.some(x => x.name.toLowerCase() === name.toLowerCase())) { lineTo(me, 'that name is taken', 'err'); return; }
-    const inGame = game.phase !== 'lobby' && game.phase !== 'over';
-    p = { id, name, total: 0, cards: [], mods: [], scCard: null, flip7: false, status: inGame ? 'stayed' : 'active' };
-    game.players.push(p);
-    line(`+ ${name} sits at the table (${game.players.length} player${game.players.length > 1 ? 's' : ''})`, 'good');
-    if (!inGame && game.players.length >= 2) line('type start to begin', 'prompt');
-    else if (inGame) lineTo(p, 'you join starting next round', 'sys');
+    if (!name || !/^[\w-]{1,12}$/.test(name)) { lineId(id, 'usage: join <name> (letters/numbers, max 12)', 'err'); return; }
+    nicks.set(id, name);
+    lineId(id, `hi ${name} · tables lists tables, create <table> makes one, enter <table> joins one`, 'good');
     return;
   }
 
-  if (!p) { lineTo(me, 'join first: join <name>', 'err'); return; }
+  if (c === 'tables') {
+    if (!tables.size) { lineId(id, 'no tables yet: create <table>', 'sys'); return; }
+    lineId(id, '── tables ──', 'table');
+    for (const t of tables.values()) {
+      const st = t.phase === 'lobby' || t.phase === 'over' ? 'waiting' : `playing (round ${t.round})`;
+      lineId(id, ` · ${t.name.padEnd(12)} ${t.players.length} player${t.players.length === 1 ? '' : 's'}  ${st}`, 'table');
+    }
+    return;
+  }
 
-  if (c === 'table') { tableLines().forEach(t => lineTo(p, t, 'table')); return; }
+  if (c === 'create' || c === 'enter') {
+    if (seat) { lineId(id, `you're already at table ${seat.t.name}`, 'err'); return; }
+    if (!nick) { lineId(id, 'pick your name first: join <name>', 'err'); return; }
+    const tname = rest[0];
+    if (!tname || !/^[\w-]{1,12}$/.test(tname)) { lineId(id, `usage: ${c} <table> (letters/numbers, max 12)`, 'err'); return; }
+    const key = tname.toLowerCase();
+    let t = tables.get(key);
+    if (c === 'create') {
+      if (t) { lineId(id, `table ${t.name} already exists: enter ${t.name}`, 'err'); return; }
+      t = newTable(tname);
+      tables.set(key, t);
+    } else {
+      if (!t) { lineId(id, `no table named ${tname}: tables lists them`, 'err'); return; }
+      if (t.phase !== 'lobby' && t.phase !== 'over') { lineId(id, `table ${t.name} already started`, 'err'); return; }
+      if (t.players.some(x => x.name.toLowerCase() === nick.toLowerCase())) { lineId(id, `name ${nick} is taken at that table`, 'err'); return; }
+    }
+    const p = { id, name: nick, total: 0, cards: [], mods: [], scCard: null, flip7: false, status: 'active' };
+    t.players.push(p);
+    line(t, `+ ${nick} sits at table ${t.name} (${t.players.length} player${t.players.length > 1 ? 's' : ''})`, 'good');
+    lineTo(p, 'type start when ready (bots fill the table up to 3 players)', 'prompt');
+    return;
+  }
 
-  if (c === 'fliptable') { fliptable(p); return; }
+  if (!seat) { lineId(id, nick ? 'you are not at a table: tables, create <table> or enter <table>' : 'pick your name first: join <name>', 'err'); return; }
+  const { t, p } = seat;
+
+  if (c === 'leave') {
+    if (t.phase !== 'lobby' && t.phase !== 'over') { lineTo(p, "you can't leave mid-game (end ends the table)", 'err'); return; }
+    t.players = t.players.filter(x => x !== p);
+    lineTo(p, `you left table ${t.name}`, 'sys');
+    line(t, `${p.name} left the table (${t.players.length} left)`, 'sys');
+    if (!t.players.some(x => !x.isBot)) tables.delete(t.name.toLowerCase());
+    return;
+  }
+
+  if (c === 'table') { tableLines(t).forEach(x => lineTo(p, x, 'table')); return; }
+
+  if (c === 'end') { endTable(t, p); return; }
+
+  if (c === 'fliptable') { fliptable(t, p); return; }
 
   if (c === 'debug') {
-    const inHands = game.players.reduce((a, x) => a + x.cards.length + x.mods.length + (x.scCard ? 1 : 0), 0);
-    lineTo(p, `debug: deck ${game.deck.length} discard ${game.discard.length} hands ${inHands} total ${game.deck.length + game.discard.length + inHands}`, 'sys');
+    const inHands = t.players.reduce((a, x) => a + x.cards.length + x.mods.length + (x.scCard ? 1 : 0), 0);
+    lineTo(p, `debug: deck ${t.deck.length} discard ${t.discard.length} hands ${inHands} total ${t.deck.length + t.discard.length + inHands}`, 'sys');
     return;
   }
 
   if (c === 'start') {
-    if (game.phase !== 'lobby' && game.phase !== 'over') { lineTo(p, 'game already in progress', 'err'); return; }
-    game.players = game.players.filter(x => !x.isBot);
-    const free = BOT_NAMES.filter(n => !game.players.some(x => x.name.toLowerCase() === n));
-    while (game.players.length < 3) {
+    if (t.phase !== 'lobby' && t.phase !== 'over') { lineTo(p, 'game already in progress', 'err'); return; }
+    t.players = t.players.filter(x => !x.isBot);
+    const free = BOT_NAMES.filter(n => !t.players.some(x => x.name.toLowerCase() === n));
+    while (t.players.length < 3) {
       const b = { id: 'bot-' + free.length, name: free.pop(), total: 0, cards: [], mods: [], scCard: null, flip7: false, status: 'active', isBot: true };
-      game.players.push(b);
-      line(`+ ${b.name} sits at the table (bot)`, 'good');
+      t.players.push(b);
+      line(t, `+ ${b.name} sits at table ${t.name} (bot)`, 'good');
     }
-    line(`${p.name} starts the game to 200 points`, 'good');
-    startGame();
+    line(t, `${p.name} starts the game to 200 points`, 'good');
+    startGame(t);
     return;
   }
 
-  if (game.pending && game.pending.chooser === p) {
+  if (t.pending && t.pending.chooser === p) {
     const nm = (c === 'freeze' || c === 'flip3' || c === 'give') ? rest[0] : cmd;
-    const target = game.pending.elig.find(e => e.name.toLowerCase() === (nm || '').toLowerCase());
-    if (!target) { lineTo(p, `invalid target. options: ${game.pending.elig.map(e => e.name).join(' | ')}`, 'err'); return; }
-    resolveChoice(p, target);
+    const target = t.pending.elig.find(e => e.name.toLowerCase() === (nm || '').toLowerCase());
+    if (!target) { lineTo(p, `invalid target. options: ${t.pending.elig.map(e => e.name).join(' | ')}`, 'err'); return; }
+    resolveChoice(t, p, target);
     return;
   }
 
   if (c === 'hit' || c === 'stay') {
-    if (game.phase !== 'playing') { lineTo(p, "you can't do that now", 'err'); return; }
-    if (game.pending) { lineTo(p, 'a choice is pending', 'err'); return; }
-    if (game.players[game.turn] !== p) { lineTo(p, 'not your turn', 'err'); return; }
+    if (t.phase !== 'playing') { lineTo(p, "you can't do that now", 'err'); return; }
+    if (t.pending) { lineTo(p, 'a choice is pending', 'err'); return; }
+    if (t.players[t.turn] !== p) { lineTo(p, 'not your turn', 'err'); return; }
     if (p.status !== 'active') { lineTo(p, "you're out of this round", 'err'); return; }
-    if (c === 'hit') { game.tasks.push({ player: p, source: 'hit' }); proceed(); }
-    else { p.status = 'stayed'; line(`${p.name} stays`, 'sys'); proceed(); }
+    if (c === 'hit') { t.tasks.push({ player: p, source: 'hit' }); proceed(t); }
+    else { p.status = 'stayed'; line(t, `${p.name} stays`, 'sys'); proceed(t); }
     return;
   }
 
@@ -384,7 +452,7 @@ const WELCOME = [
   ' |_| |_|_| .__/  /_/   ',
   '         |_|           ',
   'welcome to flipterm · type: join <name>',
-  'help to see commands',
+  'then create <table> or enter <table> · help to see commands',
 ];
 
 const server = http.createServer((req, res) => {
@@ -400,9 +468,9 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     conns.set(id, res);
     req.on('close', () => { if (conns.get(id) === res) conns.delete(id); });
-    const p = game.players.find(x => x.id === id);
-    const lines = p ? [`reconnected as ${p.name}`] : WELCOME;
-    lines.forEach(t => res.write(`data: ${JSON.stringify({ type: 'line', text: t, cls: 'sys' })}\n\n`));
+    const seat = findSeat(id);
+    const lines = seat ? [`reconnected as ${seat.p.name} at table ${seat.t.name}`] : WELCOME;
+    lines.forEach(x => res.write(`data: ${JSON.stringify({ type: 'line', text: x, cls: 'sys' })}\n\n`));
     return;
   }
   if (u.pathname === '/cmd' && req.method === 'POST') {
@@ -418,5 +486,9 @@ const server = http.createServer((req, res) => {
   res.writeHead(404);
   res.end();
 });
+
+setInterval(() => {
+  for (const res of conns.values()) { try { res.write(': ka\n\n'); } catch {} }
+}, 25000);
 
 server.listen(PORT, () => console.log(`flipterm · http://localhost:${PORT}`));

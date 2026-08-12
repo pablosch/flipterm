@@ -19,18 +19,32 @@ Then open `http://localhost:7177` in your browser.
 
 To play from another device on the same network, open `http://<your-local-ip>:7177`.
 
+## Play online
+
+The server holds all game state, so remote play just needs the server reachable on the internet. Everyone opens the same URL; each group creates its own table (`create <table>`) and others join it with `enter <table>` before it starts.
+
+- **Render (free)**: create a Web Service from this repo, no build command, start command `node server.js`. The free tier sleeps after idle and the game state lives in memory, so an in-progress game is lost when it spins down.
+- **Quick session without deploying**: run it locally and expose it with `cloudflared tunnel --url http://localhost:7177` (or ngrok), then share the URL.
+
+The server reads the port from the `PORT` env var (defaults to 7177).
+
 ## How to play
 
 Type commands at the `flipterm>` prompt:
 
 | Command | Action |
 |---|---|
-| `join <name>` | sit at the table |
+| `join <name>` | pick your player name |
+| `tables` | list tables |
+| `create <table>` | create a table and sit at it |
+| `enter <table>` | sit at an existing table (before it starts) |
+| `leave` | leave your table (before it starts) |
 | `start` | start the game (bots fill the table up to 3 players) |
 | `hit` | draw a card on your turn |
 | `stay` | stand and bank your points |
 | `<name>` | pick a target when the game asks (FREEZE / FLIP3 / SECOND CHANCE) |
-| `table` | reprint the table |
+| `table` | reprint your table |
+| `end` | end your table and clear all seats |
 | `fliptable` | (╯°□°)╯︵ ┻━┻ everything flies and the game is voided |
 | `help` | show the command list |
 
